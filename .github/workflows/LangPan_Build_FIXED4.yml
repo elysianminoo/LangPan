@@ -1,0 +1,222 @@
+name: LangPan Android Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: langpan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_VERSION: "0.1.0"
+  APP_VERSION_CODE: "1"
+  FLUTTER_VERSION: "3.47.4"
+  APPLICATION_ID: "com.langpan.app"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate LangPan source ZIP
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f "LangPan_Source.zip" ]]; then
+            echo "source=LangPan_Source.zip" >> "$GITHUB_OUTPUT"
+          else
+            mapfile -t files < <(find . -maxdepth 1 -type f -name 'LangPan_Source*.zip' -printf '%f\n' | sort)
+            if [[ "${#files[@]}" -ne 1 ]]; then
+              echo "::error::Exactly one LangPan_Source*.zip is required in repository root."
+              printf '%s\n' "${files[@]:-<none>}"
+              exit 1
+            fi
+            echo "source=${files[0]}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify source ZIP
+        shell: bash
+        env:
+          SOURCE_ZIP: ${{ steps.locate.outputs.source }}
+        run: |
+          set -euo pipefail
+          unzip -t "$SOURCE_ZIP" >/dev/null
+
+      - name: Extract source
+        shell: bash
+        env:
+          SOURCE_ZIP: ${{ steps.locate.outputs.source }}
+        run: |
+          set -euo pipefail
+          rm -rf app_src
+          mkdir app_src
+          unzip -q "$SOURCE_ZIP" -d app_src
+
+          if [[ -f app_src/pubspec.yaml ]]; then
+            echo "SRC_DIR=$PWD/app_src" >> "$GITHUB_ENV"
+          else
+            mapfile -t dirs < <(find app_src -mindepth 1 -maxdepth 1 -type d -print)
+            if [[ "${#dirs[@]}" -ne 1 || ! -f "${dirs[0]}/pubspec.yaml" ]]; then
+              echo "::error::The ZIP must contain one Flutter project with pubspec.yaml at its root."
+              exit 1
+            fi
+            echo "SRC_DIR=${dirs[0]}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Validate LangPan source
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Eq '^version:[[:space:]]*0\.1\.0\+1[[:space:]]*$' pubspec.yaml
+          grep -Eq '^[[:space:]]*flutter_lints:[[:space:]]*' pubspec.yaml
+          grep -Fxq 'include: package:flutter_lints/flutter.yaml' analysis_options.yaml
+          test -f content/en/curriculum_map.json
+          test -f tool/validate_content.py
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("content/en/curriculum_map.json").read_text())
+          levels = data.get("levels", [])
+          if not isinstance(levels, list):
+              raise SystemExit("curriculum_map.json: levels must be a list")
+
+          expected = {"pre_a1", "a1", "a2", "b1", "b2", "c1", "c2"}
+          found = set()
+
+          for level in levels:
+              if not isinstance(level, dict):
+                  raise SystemExit("curriculum_map.json: invalid level entry")
+              value = level.get("id") or level.get("cefrLevel") or level.get("cefr")
+              if isinstance(value, str):
+                  found.add(value.lower().replace("-", "_").replace(" ", "_"))
+
+          missing = expected - found
+          if missing:
+              raise SystemExit(f"Missing curriculum levels: {sorted(missing)}")
+
+          print("Curriculum map: OK")
+          PY
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          flutter --version
+          dart --version
+          java -version
+
+      - name: Install dependencies
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Format check
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+          dart format --output=none --set-exit-if-changed lib test packages
+
+      - name: Static analysis
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+          flutter analyze
+
+      - name: Tests
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+          flutter test
+
+      - name: Validate all content
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+          python3 tool/validate_content.py
+
+      - name: Prepare Android build project
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+
+          if [[ -f android/app/build.gradle.kts || -f android/app/build.gradle ]]; then
+            echo "Using Android project supplied by source."
+          else
+            tmp="$RUNNER_TEMP/langpan_android"
+            rm -rf "$tmp"
+            flutter create               --platforms=android               --project-name=app               --org=com.langpan               "$tmp"
+
+            test -f "$tmp/android/app/build.gradle.kts" || {
+              echo "::error::Flutter Android template was not generated."
+              exit 1
+            }
+
+            cp -R "$tmp/android" ./android
+          fi
+
+      - name: Verify Android application identity
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+
+          if [[ -f android/app/build.gradle.kts ]]; then
+            grep -Fq 'namespace = "com.langpan.app"' android/app/build.gradle.kts
+            grep -Fq 'applicationId = "com.langpan.app"' android/app/build.gradle.kts
+          else
+            grep -Fq "namespace 'com.langpan.app'" android/app/build.gradle || \
+              grep -Fq 'namespace "com.langpan.app"' android/app/build.gradle
+            grep -Fq "applicationId 'com.langpan.app'" android/app/build.gradle || \
+              grep -Fq 'applicationId "com.langpan.app"' android/app/build.gradle
+          fi
+
+      - name: Build release APK
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+          flutter build apk --release
+
+      - name: Verify APK and checksum
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-release.apk"
+          test -f "$apk"
+          sha256sum "$apk" | tee "$RUNNER_TEMP/langpan-apk.sha256"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LangPan-${{ env.APP_VERSION }}+${{ env.APP_VERSION_CODE }}-release
+          path: |
+            ${{ env.SRC_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+            ${{ runner.temp }}/langpan-apk.sha256
+          if-no-files-found: error
