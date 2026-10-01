@@ -64,7 +64,7 @@ jobs:
           import json
           from pathlib import Path
           m = json.loads(Path('content/en/curriculum_map.json').read_text())
-          levels = [x.get('cefrLevel') for x in m.get('levels', [])]
+          levels = [x.get('title') for x in m.get('levels', [])]
           expected = ['Pre-A1','A1','A2','B1','B2','C1','C2']
           assert levels == expected, f'Unexpected curriculum levels: {levels}'
           print('Curriculum map levels: OK')
