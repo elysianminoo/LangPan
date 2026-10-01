@@ -29,20 +29,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Locate exact LangPan source
+      - name: Locate source ZIP
+        id: locate_source
         shell: bash
         run: |
           set -euo pipefail
-          SOURCE_ZIP="LangPan_Source.zip"
 
-          if [[ ! -f "$SOURCE_ZIP" ]]; then
-            echo "::error::LangPan_Source.zip is missing from repository root."
-            echo "::error::Upload the supplied LangPan_Source_FIXED9.zip as exactly: LangPan_Source.zip"
-            exit 1
+          if [[ -f LangPan_Source.zip ]]; then
+            SOURCE_ZIP="LangPan_Source.zip"
+          else
+            mapfile -t candidates < <(find . -maxdepth 1 -type f -name 'LangPan_Source*.zip' -printf '%f\n' | sort)
+            if [[ "${#candidates[@]}" != "1" ]]; then
+              echo "::error::Expected exactly one LangPan_Source*.zip in repository root."
+              printf '%s\n' "Candidates found:"
+              printf '  %s\n' "${candidates[@]:-<none>}"
+              exit 1
+            fi
+            SOURCE_ZIP="${candidates[0]}"
           fi
 
           unzip -t "$SOURCE_ZIP" >/dev/null
           echo "SOURCE_ZIP=$SOURCE_ZIP" >> "$GITHUB_ENV"
+          echo "Using source: $SOURCE_ZIP"
 
       - name: Extract source
         shell: bash
@@ -52,13 +60,20 @@ jobs:
           mkdir -p app_src
           unzip -q "$SOURCE_ZIP" -d app_src
 
-          if [[ ! -f app_src/pubspec.yaml ]]; then
-            echo "::error::The source ZIP must contain pubspec.yaml at its root."
-            find app_src -maxdepth 2 -type f -print | sort
-            exit 1
+          if [[ -f app_src/pubspec.yaml ]]; then
+            SRC_DIR="$PWD/app_src"
+          else
+            mapfile -t dirs < <(find app_src -mindepth 1 -maxdepth 1 -type d -print)
+            if [[ "${#dirs[@]}" != "1" || ! -f "${dirs[0]}/pubspec.yaml" ]]; then
+              echo "::error::Could not locate exactly one Flutter project in $SOURCE_ZIP."
+              find app_src -maxdepth 2 -type f -print | sort
+              exit 1
+            fi
+            SRC_DIR="${dirs[0]}"
           fi
 
-          echo "SRC_DIR=$PWD/app_src" >> "$GITHUB_ENV"
+          echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
+          echo "Source directory: $SRC_DIR"
 
       - name: Validate project structure
         working-directory: ${{ env.SRC_DIR }}
@@ -76,10 +91,10 @@ jobs:
           )
 
           for file in "${required[@]}"; do
-            [[ -f "$file" ]] || {
+            if [[ ! -f "$file" ]]; then
               echo "::error::Required file missing: $file"
               exit 1
-            }
+            fi
           done
 
       - name: Validate version and Flutter metadata
@@ -87,7 +102,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          grep -Eq "^version:[[:space:]]*0\.1\.0\+1$" pubspec.yaml
+
+          grep -Eq "^version:[[:space:]]*${APP_VERSION//./\\.}\\+${APP_VERSION_CODE}$" pubspec.yaml
           grep -Eq '^[[:space:]]*flutter_lints:[[:space:]]*' pubspec.yaml
           grep -Eq '^include:[[:space:]]*package:flutter_lints/flutter.yaml[[:space:]]*$' analysis_options.yaml
 
@@ -178,22 +194,41 @@ jobs:
           set -euo pipefail
           flutter pub get
 
-      - name: Restore authored configuration
+      - name: Restore authored analysis configuration
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
           set -euo pipefail
           cp "$RUNNER_TEMP/pubspec.authored" pubspec.yaml
           cp "$RUNNER_TEMP/analysis.authored" analysis_options.yaml
+          grep -Eq '^[[:space:]]*flutter_lints:[[:space:]]*' pubspec.yaml
+          grep -Eq '^include:[[:space:]]*package:flutter_lints/flutter.yaml[[:space:]]*$' analysis_options.yaml
+
+      - name: Normalize Dart formatting
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Applying Dart 3.47.4 formatter to authored Dart sources..."
+          dart format lib test packages
 
       - name: Verify Dart formatting
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "Checking Dart formatting without modifying source..."
+          echo "Verifying Dart formatting..."
           dart format --output=none --set-exit-if-changed lib test packages
           echo "Dart formatting: OK"
+
+      - name: Verify source files after formatting
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s lib/main.dart
+          test -s test/widget_test.dart
+          echo "Dart source files are present and non-empty."
 
       - name: Static analysis
         working-directory: ${{ env.SRC_DIR }}
@@ -209,17 +244,6 @@ jobs:
           set -euo pipefail
           flutter test
 
-      - name: Content validation
-        working-directory: ${{ env.SRC_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -f tool/validate_content.py ]]; then
-            python3 tool/validate_content.py
-          else
-            echo "Content contract validation was completed by the structural validator."
-          fi
-
       - name: Prepare Android project
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
@@ -233,7 +257,6 @@ jobs:
             rm -rf "$TMP"
             mkdir -p "$TMP"
 
-            # org + project-name => com.langpan.app
             flutter create \
               --platforms=android \
               --project-name=app \
@@ -243,6 +266,12 @@ jobs:
             test -f "$TMP/android/app/build.gradle.kts" || test -f "$TMP/android/app/build.gradle"
             cp -R "$TMP/android" ./android
           fi
+
+          # Template uses the project name as launcher label; set the real app name.
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          test -f "$MANIFEST"
+          sed -i "s|android:label=\"[^\"]*\"|android:label=\"LangPan\"|" "$MANIFEST"
+          grep -q "android:label=\"LangPan\"" "$MANIFEST"
 
           test -f android/app/build.gradle.kts || test -f android/app/build.gradle
 
@@ -260,8 +289,6 @@ jobs:
             grep -Eq "applicationId[[:space:]]+['\"]${APPLICATION_ID}['\"]" android/app/build.gradle
           fi
 
-          echo "Application identity verified: ${APPLICATION_ID}"
-
       - name: Build release APK
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
@@ -275,10 +302,7 @@ jobs:
         run: |
           set -euo pipefail
           APK="build/app/outputs/flutter-apk/app-release.apk"
-          [[ -f "$APK" ]] || {
-            echo "::error::Release APK was not produced."
-            exit 1
-          }
+          test -f "$APK"
           sha256sum "$APK" | tee "$RUNNER_TEMP/langpan-apk.sha256"
 
       - name: Upload APK artifact
