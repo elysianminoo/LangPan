@@ -96,9 +96,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # flutter create may regenerate/overwrite project metadata such as
+          # pubspec.yaml and analysis_options.yaml. Preserve the authored
+          # LangPan files and restore them immediately after generation.
+          cp pubspec.yaml /tmp/langpan_pubspec.yaml
+          cp analysis_options.yaml /tmp/langpan_analysis_options.yaml
+
           flutter create --platforms=android --project-name=langpan --org=com.langpan .
+
+          cp /tmp/langpan_pubspec.yaml pubspec.yaml
+          cp /tmp/langpan_analysis_options.yaml analysis_options.yaml
+
           test -f android/app/build.gradle || test -f android/app/build.gradle.kts
-          echo 'Android project generated.'
+          grep -q '^  flutter_lints:' pubspec.yaml
+          grep -q '^include: package:flutter_lints/flutter.yaml' analysis_options.yaml
+          echo 'Android project generated; authored Flutter metadata restored.'
 
       - name: Force stable Android application identity
         working-directory: app_src
