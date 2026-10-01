@@ -1,0 +1,251 @@
+name: Build LangPan Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: langpan-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  verify-build:
+    name: Validate, test and build LangPan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    env:
+      SOURCE_ZIP: LangPan_Source.zip
+      APP_VERSION: 0.1.0
+      APP_VERSION_CODE: 1
+      FLUTTER_VERSION: '3.47.4'
+      JAVA_VERSION: '17'
+      APPLICATION_ID: com.langpan.app
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Verify source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$SOURCE_ZIP" || { echo '::error::LangPan_Source.zip is missing from repository root.'; exit 1; }
+          unzip -t "$SOURCE_ZIP" >/dev/null
+          echo 'Source ZIP integrity: OK'
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf app_src
+          mkdir -p app_src
+          unzip -q "$SOURCE_ZIP" -d app_src
+          test -f app_src/pubspec.yaml
+          test -f app_src/lib/main.dart
+          test -f app_src/content/en/curriculum_map.json
+          echo "Source files: $(find app_src -type f | wc -l)"
+
+      - name: Validate source version and content
+        working-directory: app_src
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "^version: ${APP_VERSION}+${APP_VERSION_CODE}$" pubspec.yaml
+          python3 tool/validate_content.py
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m = json.loads(Path('content/en/curriculum_map.json').read_text())
+          levels = [x.get('cefrLevel') for x in m.get('levels', [])]
+          expected = ['Pre-A1','A1','A2','B1','B2','C1','C2']
+          assert levels == expected, f'Unexpected curriculum levels: {levels}'
+          print('Curriculum map levels: OK')
+          PY
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -version
+          flutter --version
+          dart --version
+
+      - name: Generate Android project
+        working-directory: app_src
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter create --platforms=android --project-name=langpan --org=com.langpan .
+          test -f android/app/build.gradle || test -f android/app/build.gradle.kts
+          echo 'Android project generated.'
+
+      - name: Force stable Android application identity
+        working-directory: app_src
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          app_id = 'com.langpan.app'
+          candidates = [Path('android/app/build.gradle'), Path('android/app/build.gradle.kts')]
+          found = False
+          for p in candidates:
+              if not p.exists():
+                  continue
+              s = p.read_text()
+              if p.suffix == '.kts':
+                  import re
+                  s, n = re.subn(r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{app_id}"', s, count=1)
+              else:
+                  import re
+                  s, n = re.subn(r'applicationId\s+[\'\"][^\'\"]+[\'\"]', f'applicationId "{app_id}"', s, count=1)
+              if n == 0:
+                  raise SystemExit(f'Could not locate applicationId in {p}')
+              p.write_text(s)
+              found = True
+          assert found, 'Android app Gradle file not found'
+          print('Application ID set to', app_id)
+          PY
+          grep -Rqs "${APPLICATION_ID}" android/app
+
+      - name: Restore Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            app_src/android/.gradle
+          key: ${{ runner.os }}-langpan-gradle-${{ hashFiles('app_src/android/**/*.gradle*', 'app_src/android/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-langpan-gradle-
+
+      - name: Get dependencies
+        working-directory: app_src
+        run: flutter pub get
+
+      - name: Format check
+        working-directory: app_src
+        run: dart format --output=none --set-exit-if-changed lib test tool
+
+      - name: Static analysis
+        working-directory: app_src
+        run: flutter analyze
+
+      - name: Unit and widget tests
+        working-directory: app_src
+        run: flutter test
+
+      - name: Prepare optional release signing
+        working-directory: app_src
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.LANGPAN_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.LANGPAN_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.LANGPAN_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.LANGPAN_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${KEYSTORE_B64}" && -n "${KEYSTORE_PASSWORD}" && -n "${KEY_PASSWORD}" && -n "${KEY_ALIAS}" ]]; then
+            printf '%s' "$KEYSTORE_B64" | base64 --decode > android/key.jks
+            chmod 600 android/key.jks
+            python3 - <<'PY'
+          from pathlib import Path
+          groovy = Path('android/app/build.gradle')
+          kts = Path('android/app/build.gradle.kts')
+          if groovy.exists():
+              p = groovy
+              s = p.read_text()
+              if "signingConfigs {" not in s:
+                  marker = "android {"
+                  insert = '''android {\n    signingConfigs {\n        release {\n            def props = new Properties()\n            def propsFile = rootProject.file('key.properties')\n            if (propsFile.exists()) { props.load(new FileInputStream(propsFile)) }\n            keyAlias props['keyAlias']\n            keyPassword props['keyPassword']\n            storeFile props['storeFile'] ? file(props['storeFile']) : null\n            storePassword props['storePassword']\n        }\n    }'''
+                  s = s.replace(marker, insert, 1)
+              s = s.replace("signingConfig signingConfigs.debug", "signingConfig signingConfigs.release", 1)
+              p.write_text(s)
+          elif kts.exists():
+              p = kts
+              s = p.read_text()
+              if 'signingConfigs {' not in s:
+                  marker = 'android {'
+                  insert = '''android {\n    signingConfigs {\n        create("release") {\n            val propsFile = rootProject.file("key.properties")\n            if (propsFile.exists()) {\n                val props = java.util.Properties().apply { load(propsFile.inputStream()) }\n                keyAlias = props.getProperty("keyAlias")\n                keyPassword = props.getProperty("keyPassword")\n                storeFile = props.getProperty("storeFile")?.let { file(it) }\n                storePassword = props.getProperty("storePassword")\n            }\n        }\n    }'''
+                  s = s.replace(marker, insert, 1)
+              s = s.replace('signingConfig = signingConfigs.getByName("debug")', 'signingConfig = signingConfigs.getByName("release")', 1)
+              p.write_text(s)
+          else:
+              raise SystemExit('No Android app Gradle file found')
+          print('Release signing configuration injected.')
+          PY
+            cat > android/key.properties <<EOF
+          storePassword=${KEYSTORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          storeFile=key.jks
+          EOF
+            # key.properties must be created before Gradle evaluates signing configuration.
+            echo 'Signing material restored and release signing configured.'
+          else
+            echo 'Signing secrets not supplied; release APK will be unsigned.'
+          fi
+
+      - name: Build release APK
+        working-directory: app_src
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build apk --release
+          test -s build/app/outputs/flutter-apk/app-release.apk
+          sha256sum build/app/outputs/flutter-apk/app-release.apk | tee build/app/outputs/flutter-apk/app-release.apk.sha256
+
+      - name: Verify APK signature when signing was configured
+        working-directory: app_src
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.LANGPAN_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${KEYSTORE_B64}" ]]; then
+            command -v apksigner >/dev/null 2>&1 || { echo '::error::apksigner is not available on the runner.'; exit 1; }
+            apksigner verify --verbose build/app/outputs/flutter-apk/app-release.apk
+            echo 'APK signature verification: OK'
+          else
+            echo 'No signing secret supplied; signature verification skipped.'
+          fi
+
+      - name: Verify Android identity
+        working-directory: app_src
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Rqs "${APPLICATION_ID}" android/app
+          echo "applicationId: ${APPLICATION_ID}"
+          echo "version: ${APP_VERSION}+${APP_VERSION_CODE}"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: langpan-android-${{ env.APP_VERSION }}-${{ env.APP_VERSION_CODE }}
+          if-no-files-found: error
+          path: |
+            app_src/build/app/outputs/flutter-apk/app-release.apk
+            app_src/build/app/outputs/flutter-apk/app-release.apk.sha256
+          retention-days: 14
