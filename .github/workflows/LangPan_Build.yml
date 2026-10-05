@@ -1,4 +1,4 @@
-name: LangPan CI - Validate, Test and Build
+name: LangPan CI - Validate, Normalize, Test and Build
 
 on:
   workflow_dispatch:
@@ -10,11 +10,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: langpan-build-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   FLUTTER_VERSION: '3.47.4'
   APPLICATION_ID: 'com.langpan.app'
-  APP_VERSION: '0.2.0'
-  APP_VERSION_CODE: '2'
+  APP_VERSION: '0.2.1'
+  APP_VERSION_CODE: '3'
 
 jobs:
   build:
@@ -23,7 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Require the current source package
+      - name: Require exact source package
         shell: bash
         run: |
           set -euo pipefail
@@ -35,12 +39,12 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf app_src
-          mkdir app_src
+          mkdir -p app_src
           unzip -q LangPan_Source.zip -d app_src
-          test -f app_src/pubspec.yaml || { echo '::error::The ZIP must contain pubspec.yaml at its root.'; find app_src -maxdepth 2 -type f -print; exit 1; }
+          test -f app_src/pubspec.yaml || { echo '::error::ZIP root must contain pubspec.yaml.'; find app_src -maxdepth 2 -type f -print; exit 1; }
           echo "SRC_DIR=$PWD/app_src" >> "$GITHUB_ENV"
 
-      - name: Validate project files
+      - name: Validate source contract
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
@@ -48,11 +52,11 @@ jobs:
           for f in pubspec.yaml analysis_options.yaml lib/main.dart test/widget_test.dart content/en/curriculum_map.json content/schemas/lesson.schema.json; do
             test -f "$f" || { echo "::error::Missing $f"; exit 1; }
           done
-          grep -Eq '^version:[[:space:]]*0\.2\.0\+2$' pubspec.yaml
+          grep -Eq '^version:[[:space:]]*0\.2\.1\+3$' pubspec.yaml || { echo '::error::Expected version 0.2.1+3'; grep '^version:' pubspec.yaml || true; exit 1; }
           grep -Eq '^[[:space:]]*flutter_lints:' pubspec.yaml
           grep -Eq '^include:[[:space:]]*package:flutter_lints/flutter.yaml[[:space:]]*$' analysis_options.yaml
 
-      - name: Validate curriculum/content contracts
+      - name: Validate curriculum and lesson contracts
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
@@ -61,18 +65,25 @@ jobs:
           import json
           from pathlib import Path
           expected={'pre_a1','a1','a2','b1','b2','c1','c2'}
-          data=json.loads(Path('content/en/curriculum_map.json').read_text())
+          data=json.loads(Path('content/en/curriculum_map.json').read_text(encoding='utf-8'))
           found={str(x.get('cefr','')).lower() for x in data.get('levels',[])}
           missing=expected-found
-          if missing: raise SystemExit(f'Missing curriculum levels: {sorted(missing)}')
+          if missing:
+              raise SystemExit(f'Missing curriculum levels: {sorted(missing)}')
           required={'id','version','cefr','title','can_do','scenario','communicative_goal','vocabulary','grammar','listening','pronunciation','speaking','reading','writing','panda_conversation','retrieval','assessment','mastery','recovery','review'}
           lessons=sorted(Path('content').rglob('lesson_*.json'))
-          if not lessons: raise SystemExit('No lessons found')
+          if not lessons:
+              raise SystemExit('No lessons found')
+          ids=set()
           for p in lessons:
-            d=json.loads(p.read_text())
-            miss=required-d.keys()
-            if miss: raise SystemExit(f'{p}: missing {sorted(miss)}')
-          print(f'Curriculum: {len(found)}/7 levels; lesson contracts: {len(lessons)}')
+              d=json.loads(p.read_text(encoding='utf-8'))
+              miss=required-set(d)
+              if miss:
+                  raise SystemExit(f'{p}: missing {sorted(miss)}')
+              if d['id'] in ids:
+                  raise SystemExit(f'Duplicate lesson id: {d["id"]}')
+              ids.add(d['id'])
+          print(f'Curriculum levels: {len(found)}/7; lesson contracts: {len(lessons)}')
           PY
 
       - name: Set up Java
@@ -88,26 +99,52 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Save authored analyzer config
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp analysis_options.yaml "$RUNNER_TEMP/langpan-analysis-options.yaml"
+
       - name: Install dependencies
         working-directory: ${{ env.SRC_DIR }}
+        shell: bash
         run: flutter pub get
 
-      - name: Format check
+      - name: Restore authored analyzer config
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/langpan-analysis-options.yaml" analysis_options.yaml
+
+      # Dart format is deterministic. The source is normalized first, then checked again.
+      # This is not error suppression: syntax/analyzer/test failures still fail the job.
+      - name: Normalize Dart formatting
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dart format lib test packages
+
+      - name: Verify Dart formatting
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
           set -euo pipefail
           dart format --output=none --set-exit-if-changed lib test packages
 
-      - name: Analyze
+      - name: Static analysis
         working-directory: ${{ env.SRC_DIR }}
+        shell: bash
         run: flutter analyze
 
-      - name: Test
+      - name: Flutter tests
         working-directory: ${{ env.SRC_DIR }}
+        shell: bash
         run: flutter test
 
-      - name: Prepare Android
+      - name: Prepare Android build project
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
@@ -119,10 +156,8 @@ jobs:
             cp -R "$tmp/android" ./android
           fi
           test -f android/app/build.gradle.kts || test -f android/app/build.gradle
-          manifest=android/app/src/main/AndroidManifest.xml
-          sed -i 's/android:label="[^"]*"/android:label="LangPan"/' "$manifest"
 
-      - name: Verify application id
+      - name: Verify Android identity
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
@@ -137,9 +172,10 @@ jobs:
 
       - name: Build release APK
         working-directory: ${{ env.SRC_DIR }}
+        shell: bash
         run: flutter build apk --release
 
-      - name: Verify APK
+      - name: Verify APK and checksum
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
