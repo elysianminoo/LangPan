@@ -17,8 +17,8 @@ concurrency:
 env:
   FLUTTER_VERSION: '3.47.4'
   APPLICATION_ID: 'com.langpan.app'
-  APP_VERSION: '0.3.0'
-  APP_VERSION_CODE: '5'
+  APP_VERSION: '0.4.0'
+  APP_VERSION_CODE: '6'
 
 jobs:
   build:
@@ -49,10 +49,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in pubspec.yaml analysis_options.yaml lib/main.dart test/widget_test.dart content/en/curriculum_map.json content/schemas/lesson.schema.json docs/DESIGN_SYSTEM.md docs/PANDA_SYSTEM.md docs/PEDAGOGY_RUNTIME.md; do
+          for f in pubspec.yaml analysis_options.yaml lib/main.dart test/widget_test.dart content/en/curriculum_map.json content/schemas/lesson.schema.json docs/DESIGN_SYSTEM.md docs/PANDA_SYSTEM.md docs/PEDAGOGY_RUNTIME.md lib/src/speech_service.dart lib/src/speech_practice.dart lib/src/tts_service.dart lib/src/profile_store.dart assets/brand/langpan_icon.png; do
             test -f "$f" || { echo "::error::Missing $f"; exit 1; }
           done
-          grep -Eq '^version:[[:space:]]*0\.3\.0\+5$' pubspec.yaml || { echo '::error::Expected version 0.3.0+5'; grep '^version:' pubspec.yaml || true; exit 1; }
+          grep -Eq '^version:[[:space:]]*0\.4\.0\+6$' pubspec.yaml || { echo '::error::Expected version 0.4.0+6'; grep '^version:' pubspec.yaml || true; exit 1; }
           grep -Eq '^[[:space:]]*flutter_lints:' pubspec.yaml
           grep -Eq '^include:[[:space:]]*package:flutter_lints/flutter.yaml[[:space:]]*$' analysis_options.yaml
 
@@ -156,11 +156,48 @@ jobs:
             cp -R "$tmp/android" ./android
           fi
           test -f android/app/build.gradle.kts || test -f android/app/build.gradle
+          if [[ -f android/app/build.gradle.kts ]]; then
+            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/' android/app/build.gradle.kts
+          else
+            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' android/app/build.gradle
+          fi
           # The template uses the project name ("app") as launcher label.
           manifest=android/app/src/main/AndroidManifest.xml
           test -f "$manifest"
           sed -i 's|android:label="[^"]*"|android:label="LangPan"|' "$manifest"
           grep -q 'android:label="LangPan"' "$manifest"
+
+          python3 - "$manifest" <<'PY'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding='utf-8')
+          permissions = [
+              '    <uses-permission android:name="android.permission.RECORD_AUDIO"/>',
+              '    <uses-permission android:name="android.permission.INTERNET"/>',
+          ]
+          for line in permissions:
+              if line not in text:
+                  text = text.replace('<application', line + '\n    <application', 1)
+          if '<queries>' not in text:
+              text = text.replace('    <application', '    <queries>\n        <intent>\n            <action android:name="android.speech.RecognitionService" />\n        </intent>\n    </queries>\n    <application', 1)
+          text = text.replace('android:icon="@mipmap/ic_launcher"', 'android:icon="@drawable/langpan_icon"')
+          path.write_text(text, encoding='utf-8')
+          PY
+          mkdir -p android/app/src/main/res/drawable
+          cp assets/brand/langpan_icon.png android/app/src/main/res/drawable/langpan_icon.png
+          test -s android/app/src/main/res/drawable/langpan_icon.png
+
+      - name: Verify Android audio and brand resources
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.RECORD_AUDIO' "$manifest"
+          grep -q 'android.speech.RecognitionService' "$manifest"
+          grep -q 'android:icon="@drawable/langpan_icon"' "$manifest"
+          test -s android/app/src/main/res/drawable/langpan_icon.png
 
       - name: Verify Android identity
         working-directory: ${{ env.SRC_DIR }}
