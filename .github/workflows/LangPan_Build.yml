@@ -179,8 +179,17 @@ jobs:
           for line in permissions:
               if line not in text:
                   text = text.replace('<application', line + '\n    <application', 1)
-          if '<queries>' not in text:
-              text = text.replace('    <application', '    <queries>\n        <intent>\n            <action android:name="android.speech.RecognitionService" />\n        </intent>\n    </queries>\n    <application', 1)
+          intents = [
+              ('android.speech.RecognitionService', '        <intent>\n            <action android:name="android.speech.RecognitionService" />\n        </intent>\n'),
+              ('android.intent.action.TTS_SERVICE', '        <intent>\n            <action android:name="android.intent.action.TTS_SERVICE" />\n        </intent>\n'),
+          ]
+          missing = ''.join(block for key, block in intents if key not in text)
+          if missing:
+              if '<queries>' in text:
+                  # The Flutter template already declares a <queries> block.
+                  text = text.replace('<queries>', '<queries>\n' + missing.rstrip('\n'), 1)
+              else:
+                  text = text.replace('<application', '<queries>\n' + missing + '    </queries>\n    <application', 1)
           text = text.replace('android:icon="@mipmap/ic_launcher"', 'android:icon="@drawable/langpan_icon"')
           path.write_text(text, encoding='utf-8')
           PY
@@ -196,6 +205,7 @@ jobs:
           manifest=android/app/src/main/AndroidManifest.xml
           grep -q 'android.permission.RECORD_AUDIO' "$manifest"
           grep -q 'android.speech.RecognitionService' "$manifest"
+          grep -q 'android.intent.action.TTS_SERVICE' "$manifest"
           grep -q 'android:icon="@drawable/langpan_icon"' "$manifest"
           test -s android/app/src/main/res/drawable/langpan_icon.png
 
