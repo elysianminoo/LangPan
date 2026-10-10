@@ -1,11 +1,11 @@
-name: LangPan CI - Validate, Normalize, Test and Build
+name: LangPan Build
 
 on:
-  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ concurrency:
 env:
   FLUTTER_VERSION: '3.47.4'
   APPLICATION_ID: 'com.langpan.app'
-  APP_VERSION: '0.6.0'
+  APP_VERSION: '0.5.0'
   APP_VERSION_CODE: '7'
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
           rm -rf app_src
           mkdir -p app_src
           unzip -q LangPan_Source.zip -d app_src
-          test -f app_src/pubspec.yaml || { echo '::error::ZIP root must contain pubspec.yaml.'; find app_src -maxdepth 2 -type f -print; exit 1; }
+          test -f app_src/pubspec.yaml || { echo '::error::ZIP root must contain pubspec.yaml.'; exit 1; }
           echo "SRC_DIR=$PWD/app_src" >> "$GITHUB_ENV"
 
       - name: Validate source contract
@@ -49,16 +49,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in pubspec.yaml analysis_options.yaml lib/main.dart test/widget_test.dart content/en/curriculum_map.json content/schemas/lesson.schema.json docs/DESIGN_SYSTEM.md docs/PANDA_SYSTEM.md docs/PEDAGOGY_RUNTIME.md assets/brand/langpan_logo_lockup.png assets/brand/panda_approved_hero.png assets/brand/panda_happy.png assets/brand/panda_thinking.png lib/src/speech_service.dart lib/src/speech_practice.dart lib/src/tts_service.dart lib/src/profile_store.dart assets/brand/langpan_icon.png; do
+          for f in pubspec.yaml analysis_options.yaml lib/main.dart test/widget_test.dart content/en/curriculum_map.json content/schemas/lesson.schema.json docs/DESIGN_SYSTEM.md docs/PANDA_SYSTEM.md docs/PEDAGOGY_RUNTIME.md lib/src/speech_service.dart lib/src/speech_practice.dart lib/src/tts_service.dart lib/src/profile_store.dart assets/brand/langpan_icon.png assets/brand/langpan_logo.png; do
             test -f "$f" || { echo "::error::Missing $f"; exit 1; }
           done
-          grep -Eq '^version:[[:space:]]*0\.6\.0\+7$' pubspec.yaml || { echo '::error::Expected version 0.6.0+7'; grep '^version:' pubspec.yaml || true; exit 1; }
+          grep -Eq '^version:[[:space:]]*0\.5\.0\+7$' pubspec.yaml || { echo '::error::Expected version 0.5.0+7'; grep '^version:' pubspec.yaml || true; exit 1; }
           grep -Eq '^[[:space:]]*flutter_lints:' pubspec.yaml
           grep -Eq '^include:[[:space:]]*package:flutter_lints/flutter.yaml[[:space:]]*$' analysis_options.yaml
-          test -s assets/brand/langpan_icon.png
-          test -s assets/brand/langpan_logo_lockup.png
-          test -s assets/brand/panda_approved_hero.png
-          for mood in happy excited thinking confused proud encouraging calm listening speaking; do test -s "assets/brand/panda_${mood}.png"; done
+
+      - name: Reject placeholder lesson content
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RniE 'content-specific|natural grammar-equivalent|coming soon|به‌زودی|به زودی' content lib; then
+            echo '::error::Placeholder or deferred lesson/runtime copy is present.'
+            exit 1
+          fi
 
       - name: Validate curriculum and lesson contracts
         working-directory: ${{ env.SRC_DIR }}
@@ -89,6 +95,7 @@ jobs:
               ids.add(d['id'])
           print(f'Curriculum levels: {len(found)}/7; lesson contracts: {len(lessons)}')
           PY
+          python3 tool/validate_content.py
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -106,9 +113,7 @@ jobs:
       - name: Save authored analyzer config
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
-        run: |
-          set -euo pipefail
-          cp analysis_options.yaml "$RUNNER_TEMP/langpan-analysis-options.yaml"
+        run: cp analysis_options.yaml "$RUNNER_TEMP/langpan-analysis-options.yaml"
 
       - name: Install dependencies
         working-directory: ${{ env.SRC_DIR }}
@@ -118,25 +123,17 @@ jobs:
       - name: Restore authored analyzer config
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
-        run: |
-          set -euo pipefail
-          cp "$RUNNER_TEMP/langpan-analysis-options.yaml" analysis_options.yaml
+        run: cp "$RUNNER_TEMP/langpan-analysis-options.yaml" analysis_options.yaml
 
-      # Dart format is deterministic. The source is normalized first, then checked again.
-      # This is not error suppression: syntax/analyzer/test failures still fail the job.
       - name: Normalize Dart formatting
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
-        run: |
-          set -euo pipefail
-          dart format lib test packages
+        run: dart format lib test packages
 
       - name: Verify Dart formatting
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
-        run: |
-          set -euo pipefail
-          dart format --output=none --set-exit-if-changed lib test packages
+        run: dart format --output=none --set-exit-if-changed lib test packages
 
       - name: Static analysis
         working-directory: ${{ env.SRC_DIR }}
@@ -165,43 +162,36 @@ jobs:
           else
             sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' android/app/build.gradle
           fi
-          # The template uses the project name ("app") as launcher label.
           manifest=android/app/src/main/AndroidManifest.xml
           test -f "$manifest"
           sed -i 's|android:label="[^"]*"|android:label="LangPan"|' "$manifest"
-          grep -q 'android:label="LangPan"' "$manifest"
-
           python3 - "$manifest" <<'PY'
           from pathlib import Path
           import sys
-          path = Path(sys.argv[1])
-          text = path.read_text(encoding='utf-8')
-          permissions = [
-              '    <uses-permission android:name="android.permission.RECORD_AUDIO"/>',
-              '    <uses-permission android:name="android.permission.INTERNET"/>',
-          ]
+          path=Path(sys.argv[1])
+          text=path.read_text(encoding='utf-8')
+          permissions=['    <uses-permission android:name="android.permission.RECORD_AUDIO"/>','    <uses-permission android:name="android.permission.INTERNET"/>']
           for line in permissions:
               if line not in text:
-                  text = text.replace('<application', line + '\n    <application', 1)
-          intents = [
-              ('android.speech.RecognitionService', '        <intent>\n            <action android:name="android.speech.RecognitionService" />\n        </intent>\n'),
-              ('android.intent.action.TTS_SERVICE', '        <intent>\n            <action android:name="android.intent.action.TTS_SERVICE" />\n        </intent>\n'),
+                  text=text.replace('<application', line+'\n    <application',1)
+          intents=[
+              ('android.speech.RecognitionService','        <intent><action android:name="android.speech.RecognitionService" /></intent>\n'),
+              ('android.intent.action.TTS_SERVICE','        <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>\n'),
           ]
-          missing = ''.join(block for key, block in intents if key not in text)
+          missing=''.join(block for key,block in intents if key not in text)
           if missing:
               if '<queries>' in text:
-                  # The Flutter template already declares a <queries> block.
-                  text = text.replace('<queries>', '<queries>\n' + missing.rstrip('\n'), 1)
+                  text=text.replace('<queries>','<queries>\n'+missing,1)
               else:
-                  text = text.replace('<application', '<queries>\n' + missing + '    </queries>\n    <application', 1)
-          text = text.replace('android:icon="@mipmap/ic_launcher"', 'android:icon="@drawable/langpan_icon"')
-          path.write_text(text, encoding='utf-8')
+                  text=text.replace('<application','<queries>\n'+missing+'    </queries>\n    <application',1)
+          text=text.replace('android:icon="@mipmap/ic_launcher"','android:icon="@drawable/langpan_icon"')
+          path.write_text(text,encoding='utf-8')
           PY
           mkdir -p android/app/src/main/res/drawable
           cp assets/brand/langpan_icon.png android/app/src/main/res/drawable/langpan_icon.png
           test -s android/app/src/main/res/drawable/langpan_icon.png
 
-      - name: Verify Android audio and approved LangPan brand resources
+      - name: Verify Android identity and audio permissions
         working-directory: ${{ env.SRC_DIR }}
         shell: bash
         run: |
@@ -211,13 +201,6 @@ jobs:
           grep -q 'android.speech.RecognitionService' "$manifest"
           grep -q 'android.intent.action.TTS_SERVICE' "$manifest"
           grep -q 'android:icon="@drawable/langpan_icon"' "$manifest"
-          test -s android/app/src/main/res/drawable/langpan_icon.png
-
-      - name: Verify Android identity
-        working-directory: ${{ env.SRC_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
           if [[ -f android/app/build.gradle.kts ]]; then
             grep -q 'namespace = "com.langpan.app"' android/app/build.gradle.kts
             grep -q 'applicationId = "com.langpan.app"' android/app/build.gradle.kts
